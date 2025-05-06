@@ -114,3 +114,63 @@
 
 (define-read-only (get-consultation (consultation-id uint))
   (ok (map-get? consultations {consultation-id: consultation-id})))
+
+
+  (define-constant ERR-INVALID-RATING (err u104))
+(define-constant ERR-NOT-CONSULTED (err u105))
+
+(define-map doctor-ratings
+  { doctor-id: principal }
+  {
+    total-rating: uint,
+    rating-count: uint,
+    average-rating: uint
+  }
+)
+
+(define-map patient-ratings
+  { patient-id: principal, doctor-id: principal }
+  { has-rated: bool }
+)
+
+(define-public (rate-doctor (doctor-id principal) (rating uint))
+  (let 
+    (
+      (consultation (unwrap! (map-get? consultations {consultation-id: (var-get consultation-counter)}) ERR-NOT-FOUND))
+      (current-ratings (default-to {total-rating: u0, rating-count: u0, average-rating: u0} (map-get? doctor-ratings {doctor-id: doctor-id})))
+      (patient-rating (default-to {has-rated: false} (map-get? patient-ratings {patient-id: tx-sender, doctor-id: doctor-id})))
+    )
+    (asserts! (and (>= rating u1) (<= rating u5)) ERR-INVALID-RATING)
+    (asserts! (is-eq (get status consultation) "COMPLETED") ERR-NOT-CONSULTED)
+    (asserts! (not (get has-rated patient-rating)) ERR-ALREADY-REGISTERED)
+    (ok (begin
+      (map-set doctor-ratings
+        {doctor-id: doctor-id}
+        {
+          total-rating: (+ (get total-rating current-ratings) rating),
+          rating-count: (+ (get rating-count current-ratings) u1),
+          average-rating: (/ (+ (get total-rating current-ratings) rating) (+ (get rating-count current-ratings) u1))
+        })
+      (map-set patient-ratings
+        {patient-id: tx-sender, doctor-id: doctor-id}
+        {has-rated: true})))))
+
+
+
+(define-constant REFUND-WINDOW-BLOCKS u144)
+(define-constant ERR-REFUND-EXPIRED (err u106))
+(define-constant ERR-INVALID-STATUS (err u107))
+
+(define-public (cancel-consultation (consultation-id uint))
+  (let 
+    (
+      (consultation (unwrap! (map-get? consultations {consultation-id: consultation-id}) ERR-NOT-FOUND))
+      (current-height stacks-block-height)
+    )
+    (asserts! (is-eq (get patient consultation) tx-sender) ERR-NOT-AUTHORIZED)
+    (asserts! (is-eq (get status consultation) "PENDING") ERR-INVALID-STATUS)
+    (asserts! (<= (- current-height (get timestamp consultation)) REFUND-WINDOW-BLOCKS) ERR-REFUND-EXPIRED)
+    (try! (as-contract (stx-transfer? CONSULTATION-FEE (as-contract tx-sender) (get patient consultation))))
+    (ok (map-set consultations
+      {consultation-id: consultation-id}
+      (merge consultation {status: "CANCELLED"})))))
