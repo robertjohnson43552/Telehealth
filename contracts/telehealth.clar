@@ -174,3 +174,124 @@
     (ok (map-set consultations
       {consultation-id: consultation-id}
       (merge consultation {status: "CANCELLED"})))))
+
+
+(define-constant ERR-NO-EMERGENCY-DOCTORS (err u108))
+(define-constant ERR-NOT-EMERGENCY-QUALIFIED (err u109))
+(define-constant EMERGENCY-CONSULTATION-FEE u25000000)
+(define-constant EMERGENCY-BONUS u5000000)
+
+(define-map emergency-doctors
+  { doctor-id: principal }
+  { 
+    available: bool,
+    emergency-count: uint,
+    last-emergency: uint
+  }
+)
+
+(define-map emergency-consultations
+  { emergency-id: uint }
+  {
+    doctor: (optional principal),
+    patient: principal,
+    timestamp: uint,
+    status: (string-ascii 20),
+    severity: (string-ascii 10),
+    fee: uint,
+    response-time: uint
+  }
+)
+
+(define-data-var emergency-counter uint u0)
+
+(define-public (register-emergency-doctor)
+  (let ((doctor (unwrap! (map-get? doctors {doctor-id: tx-sender}) ERR-NOT-FOUND)))
+    (asserts! (get verified doctor) ERR-NOT-AUTHORIZED)
+    (asserts! (>= (get consultation-count doctor) u10) (err u204))
+    (ok (map-set emergency-doctors
+      {doctor-id: tx-sender}
+      {
+        available: true,
+        emergency-count: u0,
+        last-emergency: u0
+      }))))
+
+(define-public (request-emergency-consultation (severity (string-ascii 10)))
+  (let 
+    (
+      (emergency-id (+ (var-get emergency-counter) u1))
+      (patient (unwrap! (map-get? patients {patient-id: tx-sender}) ERR-NOT-FOUND))
+    )
+    (try! (stx-transfer? EMERGENCY-CONSULTATION-FEE tx-sender (as-contract tx-sender)))
+    (var-set emergency-counter emergency-id)
+    (ok (map-set emergency-consultations
+      {emergency-id: emergency-id}
+      {
+        doctor: none,
+        patient: tx-sender,
+        timestamp: stacks-block-height,
+        status: "URGENT",
+        severity: severity,
+        fee: EMERGENCY-CONSULTATION-FEE,
+        response-time: u0
+      }))))
+
+(define-public (accept-emergency-consultation (emergency-id uint))
+  (let 
+    (
+      (emergency (unwrap! (map-get? emergency-consultations {emergency-id: emergency-id}) ERR-NOT-FOUND))
+      (emergency-doctor (unwrap! (map-get? emergency-doctors {doctor-id: tx-sender}) ERR-NOT-FOUND))
+      (response-time (- stacks-block-height (get timestamp emergency)))
+    )
+    (asserts! (get available emergency-doctor) ERR-NOT-AUTHORIZED)
+    (asserts! (is-eq (get status emergency) "URGENT") ERR-INVALID-STATUS)
+    (try! (as-contract (stx-transfer? (get fee emergency) (as-contract tx-sender) tx-sender)))
+    (try! (as-contract (stx-transfer? EMERGENCY-BONUS (as-contract tx-sender) tx-sender)))
+    (map-set emergency-doctors
+      {doctor-id: tx-sender}
+      (merge emergency-doctor 
+        {
+          available: false,
+          emergency-count: (+ (get emergency-count emergency-doctor) u1),
+          last-emergency: stacks-block-height
+        }))
+    (ok (map-set emergency-consultations
+      {emergency-id: emergency-id}
+      (merge emergency 
+        {
+          doctor: (some tx-sender),
+          status: "IN-PROGRESS",
+          response-time: response-time
+        })))))
+
+(define-public (complete-emergency-consultation (emergency-id uint))
+  (let 
+    (
+      (emergency (unwrap! (map-get? emergency-consultations {emergency-id: emergency-id}) ERR-NOT-FOUND))
+      (doctor-id (unwrap! (get doctor emergency) ERR-NOT-FOUND))
+    )
+    (asserts! (is-eq doctor-id tx-sender) ERR-NOT-AUTHORIZED)
+    (asserts! (is-eq (get status emergency) "IN-PROGRESS") ERR-INVALID-STATUS)
+    (map-set emergency-doctors
+      {doctor-id: tx-sender}
+      (merge (unwrap! (map-get? emergency-doctors {doctor-id: tx-sender}) ERR-NOT-FOUND)
+        {available: true}))
+    (ok (map-set emergency-consultations
+      {emergency-id: emergency-id}
+      (merge emergency {status: "RESOLVED"})))))
+
+(define-public (set-emergency-availability (available bool))
+  (let ((emergency-doctor (unwrap! (map-get? emergency-doctors {doctor-id: tx-sender}) ERR-NOT-FOUND)))
+    (ok (map-set emergency-doctors
+      {doctor-id: tx-sender}
+      (merge emergency-doctor {available: available})))))
+
+(define-read-only (get-emergency-consultation (emergency-id uint))
+  (ok (map-get? emergency-consultations {emergency-id: emergency-id})))
+
+(define-read-only (get-emergency-doctor-status (doctor-id principal))
+  (ok (map-get? emergency-doctors {doctor-id: doctor-id})))
+
+(define-read-only (get-available-emergency-doctors)
+  (ok (var-get emergency-counter)))
