@@ -189,3 +189,267 @@
     total-tiers: u3,
     max-discount: PLATINUM-DISCOUNT
   }))
+
+;; Dynamic Availability & Pricing System
+(define-constant ERR-SLOT-UNAVAILABLE (err u210))
+(define-constant ERR-INVALID-TIME-SLOT (err u211))
+(define-constant ERR-BOOKING-CONFLICT (err u212))
+(define-constant ERR-INSUFFICIENT-PAYMENT (err u213))
+(define-constant ERR-INVALID-STATUS (err u214))
+
+(define-constant BASE-CONSULTATION-FEE u10000000)
+(define-constant PREMIUM-TIME-MULTIPLIER u150) ;; 50% premium for peak hours
+(define-constant SURGE-MULTIPLIER-CAP u300) ;; Max 3x surge pricing
+(define-constant SLOT-DURATION-BLOCKS u6) ;; ~1 hour slots
+(define-constant MAX-DAILY-SLOTS u12) ;; 12 slots per day maximum
+
+;; Doctor availability calendar - tracks time slots
+(define-map doctor-availability
+  { doctor-id: principal, slot-id: uint }
+  {
+    start-block: uint,
+    end-block: uint,
+    base-price: uint,
+    current-price: uint,
+    is-premium: bool,
+    is-booked: bool,
+    booking-deadline: uint,
+    demand-level: uint
+  }
+)
+
+;; Daily availability summary for efficient querying
+(define-map daily-availability
+  { doctor-id: principal, day-block: uint }
+  {
+    total-slots: uint,
+    booked-slots: uint,
+    premium-slots: uint,
+    average-price: uint,
+    peak-demand: uint
+  }
+)
+
+;; Surge pricing tracker for real-time demand
+(define-map demand-tracker
+  { specialty: (string-ascii 50), time-block: uint }
+  {
+    total-requests: uint,
+    available-doctors: uint,
+    surge-multiplier: uint,
+    last-updated: uint
+  }
+)
+
+;; Consultation bookings with time slots
+(define-map slot-bookings
+  { booking-id: uint }
+  {
+    doctor-id: principal,
+    patient-id: principal,
+    slot-id: uint,
+    booking-time: uint,
+    final-price: uint,
+    payment-status: (string-ascii 20),
+    confirmation-status: (string-ascii 20)
+  }
+)
+
+(define-data-var booking-counter uint u0)
+
+;; Create availability slots for a doctor
+(define-public (create-availability-slots (slot-start uint) (num-slots uint) (base-price uint) (is-premium bool))
+  (let 
+    (
+      (doctor-rep (unwrap! (map-get? doctor-reputation {doctor-id: tx-sender}) ERR-NOT-FOUND))
+      (day-block (/ slot-start u144)) ;; Approximate day grouping
+    )
+    (asserts! (<= num-slots MAX-DAILY-SLOTS) ERR-INVALID-AMOUNT)
+    (asserts! (>= base-price (/ BASE-CONSULTATION-FEE u2)) ERR-INVALID-AMOUNT)
+    (create-single-slot tx-sender slot-start base-price is-premium u0)
+    (if (> num-slots u1)
+      (create-single-slot tx-sender (+ slot-start SLOT-DURATION-BLOCKS) base-price is-premium u1)
+      true)
+    (if (> num-slots u2)
+      (create-single-slot tx-sender (+ slot-start (* u2 SLOT-DURATION-BLOCKS)) base-price is-premium u2)
+      true)
+    (if (> num-slots u3)
+      (create-single-slot tx-sender (+ slot-start (* u3 SLOT-DURATION-BLOCKS)) base-price is-premium u3)
+      true)
+    (update-daily-summary tx-sender day-block num-slots)
+    (ok num-slots)))
+
+;; Helper function to create a single slot
+(define-private (create-single-slot (doctor-id principal) (start-block uint) (price uint) (premium bool) (index uint))
+  (let 
+    (
+      (slot-id (+ (* start-block u1000) index))
+      (slot-end (+ start-block SLOT-DURATION-BLOCKS))
+      (adjusted-price (if premium (/ (* price PREMIUM-TIME-MULTIPLIER) u100) price))
+    )
+    (map-set doctor-availability
+      {doctor-id: doctor-id, slot-id: slot-id}
+      {
+        start-block: start-block,
+        end-block: slot-end,
+        base-price: price,
+        current-price: adjusted-price,
+        is-premium: premium,
+        is-booked: false,
+        booking-deadline: (- start-block u12), ;; 2 hours before
+        demand-level: u1
+      })
+    true))
+
+;; Update daily availability summary
+(define-private (update-daily-summary (doctor-id principal) (day-block uint) (new-slots uint))
+  (let 
+    (
+      (current-summary (default-to 
+        {total-slots: u0, booked-slots: u0, premium-slots: u0, average-price: BASE-CONSULTATION-FEE, peak-demand: u1}
+        (map-get? daily-availability {doctor-id: doctor-id, day-block: day-block})))
+    )
+    (map-set daily-availability
+      {doctor-id: doctor-id, day-block: day-block}
+      (merge current-summary {total-slots: (+ (get total-slots current-summary) new-slots)}))))
+
+;; Book a specific time slot with dynamic pricing
+(define-public (book-time-slot (doctor-id principal) (slot-id uint) (specialty (string-ascii 50)))
+  (let 
+    (
+      (slot-info (unwrap! (map-get? doctor-availability {doctor-id: doctor-id, slot-id: slot-id}) ERR-NOT-FOUND))
+      (booking-id (+ (var-get booking-counter) u1))
+      (current-block stacks-block-height)
+      (surge-price (calculate-surge-pricing specialty (get start-block slot-info)))
+      (final-price (/ (* (get current-price slot-info) surge-price) u100))
+    )
+    (asserts! (not (get is-booked slot-info)) ERR-SLOT-UNAVAILABLE)
+    (asserts! (< current-block (get booking-deadline slot-info)) ERR-INVALID-TIME-SLOT)
+    (asserts! (< current-block (get start-block slot-info)) ERR-INVALID-TIME-SLOT)
+    
+    ;; Transfer payment
+    (try! (stx-transfer? final-price tx-sender (as-contract tx-sender)))
+    
+    ;; Update slot as booked
+    (map-set doctor-availability
+      {doctor-id: doctor-id, slot-id: slot-id}
+      (merge slot-info {is-booked: true, demand-level: (+ (get demand-level slot-info) u1)}))
+    
+    ;; Create booking record
+    (map-set slot-bookings
+      {booking-id: booking-id}
+      {
+        doctor-id: doctor-id,
+        patient-id: tx-sender,
+        slot-id: slot-id,
+        booking-time: current-block,
+        final-price: final-price,
+        payment-status: "PAID",
+        confirmation-status: "PENDING"
+      })
+    
+    (var-set booking-counter booking-id)
+    (update-demand-tracking specialty (get start-block slot-info))
+    (ok booking-id)))
+
+;; Calculate surge pricing based on demand
+(define-private (calculate-surge-pricing (specialty (string-ascii 50)) (time-block uint))
+  (let 
+    (
+      (demand-data (default-to 
+        {total-requests: u1, available-doctors: u1, surge-multiplier: u100, last-updated: u0}
+        (map-get? demand-tracker {specialty: specialty, time-block: time-block})))
+      (demand-ratio (if (> (get available-doctors demand-data) u0) 
+        (/ (get total-requests demand-data) (get available-doctors demand-data)) u1))
+      (surge-multiplier (min (+ u100 (* demand-ratio u25)) SURGE-MULTIPLIER-CAP))
+    )
+    surge-multiplier))
+
+;; Update demand tracking for surge pricing
+(define-private (update-demand-tracking (specialty (string-ascii 50)) (time-block uint))
+  (let 
+    (
+      (current-demand (default-to 
+        {total-requests: u0, available-doctors: u1, surge-multiplier: u100, last-updated: u0}
+        (map-get? demand-tracker {specialty: specialty, time-block: time-block})))
+      (new-requests (+ (get total-requests current-demand) u1))
+    )
+    (map-set demand-tracker
+      {specialty: specialty, time-block: time-block}
+      (merge current-demand 
+        {
+          total-requests: new-requests,
+          surge-multiplier: (calculate-surge-pricing specialty time-block),
+          last-updated: stacks-block-height
+        }))))
+
+;; Confirm consultation completion and release payment
+(define-public (confirm-slot-consultation (booking-id uint))
+  (let 
+    (
+      (booking (unwrap! (map-get? slot-bookings {booking-id: booking-id}) ERR-NOT-FOUND))
+      (doctor-id (get doctor-id booking))
+    )
+    (asserts! (is-eq tx-sender doctor-id) ERR-NOT-AUTHORIZED)
+    (asserts! (is-eq (get confirmation-status booking) "PENDING") ERR-INVALID-STATUS)
+    
+    ;; Release payment to doctor
+    (try! (as-contract (stx-transfer? (get final-price booking) (as-contract tx-sender) doctor-id)))
+    
+    ;; Update booking status
+    (map-set slot-bookings
+      {booking-id: booking-id}
+      (merge booking {confirmation-status: "COMPLETED"}))
+    
+    (ok true)))
+
+;; Cancel booking with refund (if within cancellation window)
+(define-public (cancel-slot-booking (booking-id uint))
+  (let 
+    (
+      (booking (unwrap! (map-get? slot-bookings {booking-id: booking-id}) ERR-NOT-FOUND))
+      (slot-info (unwrap! (map-get? doctor-availability 
+        {doctor-id: (get doctor-id booking), slot-id: (get slot-id booking)}) ERR-NOT-FOUND))
+      (cancellation-deadline (- (get start-block slot-info) u24)) ;; 4 hours before
+    )
+    (asserts! (is-eq tx-sender (get patient-id booking)) ERR-NOT-AUTHORIZED)
+    (asserts! (< stacks-block-height cancellation-deadline) ERR-INVALID-TIME-SLOT)
+    
+    ;; Refund 90% of payment (10% cancellation fee)
+    (let ((refund-amount (/ (* (get final-price booking) u90) u100)))
+      (try! (as-contract (stx-transfer? refund-amount (as-contract tx-sender) (get patient-id booking))))
+    
+    ;; Mark slot as available again
+    (map-set doctor-availability
+      {doctor-id: (get doctor-id booking), slot-id: (get slot-id booking)}
+      (merge slot-info {is-booked: false}))
+    
+    ;; Update booking status
+    (map-set slot-bookings
+      {booking-id: booking-id}
+      (merge booking {confirmation-status: "CANCELLED"}))
+    
+    (ok refund-amount))))
+
+;; Get available slots for a doctor on a specific day
+(define-read-only (get-doctor-availability (doctor-id principal) (day-block uint))
+  (ok (map-get? daily-availability {doctor-id: doctor-id, day-block: day-block})))
+
+;; Get specific slot details
+(define-read-only (get-slot-details (doctor-id principal) (slot-id uint))
+  (ok (map-get? doctor-availability {doctor-id: doctor-id, slot-id: slot-id})))
+
+;; Get booking information
+(define-read-only (get-booking-details (booking-id uint))
+  (ok (map-get? slot-bookings {booking-id: booking-id})))
+
+;; Get current surge pricing for specialty and time
+(define-read-only (get-surge-pricing (specialty (string-ascii 50)) (time-block uint))
+  (ok (map-get? demand-tracker {specialty: specialty, time-block: time-block})))
+
+;; Helper function to get minimum value
+(define-private (min (a uint) (b uint))
+  (if (< a b) a b))
+
+
+
