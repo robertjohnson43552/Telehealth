@@ -15,6 +15,11 @@ path = 'contracts/doctor-reputation.clar'
 clarity_version = 3
 epoch = 3.1
 
+[contracts.medical-records-consent]
+path = 'contracts/medical-records-consent.clar'
+clarity_version = 3
+epoch = 3.1
+
 [repl.analysis]
 passes = ['check_checker']
 
