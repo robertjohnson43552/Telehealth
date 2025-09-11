@@ -1,0 +1,30 @@
+[project]
+name = 'telehealth'
+description = ''
+authors = []
+telemetry = true
+cache_dir = '.\.cache'
+requirements = []
+[contracts.telehealth]
+path = 'contracts/telehealth.clar'
+clarity_version = 3
+epoch = 3.1
+
+[contracts.doctor-reputation]
+path = 'contracts/doctor-reputation.clar'
+clarity_version = 3
+epoch = 3.1
+
+[contracts.medical-records-consent]
+path = 'contracts/medical-records-consent.clar'
+clarity_version = 3
+epoch = 3.1
+
+[repl.analysis]
+passes = ['check_checker']
+
+[repl.analysis.check_checker]
+strict = false
+trusted_sender = false
+trusted_caller = false
+callee_filter = false
